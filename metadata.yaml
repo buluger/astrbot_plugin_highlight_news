@@ -1,0 +1,6 @@
+name: quote_collocter # 这是你的插件的唯一识别名。
+desc: 记录群友精华（文字或图片），随机回顾或生成汇总长图（需 Pillow） # 插件简短描述
+help: 「精华投稿」+文字/图片/引用消息；「/精华」随机一条；「精华图」全部列表长图；戳一戳随机一条 # 插件的帮助信息
+version: v1.0 # 插件版本号
+author: 浅夏旧入梦 # 作者
+repo: https://github.com/litsum/astrbot_plugin_quote_collocter # 插件的仓库地址
