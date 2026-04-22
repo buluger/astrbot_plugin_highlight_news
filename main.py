@@ -54,7 +54,10 @@ def _pick_cjk_font(size: int):
 class HighlightsPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_root = os.path.join("data", "highlights_data")
+        # 优先使用 AstrBot 插件数据目录规范
+        self.data_root = os.path.join("data", "plugin_data", "astrbot_plugin_highlight_news")
+        self.legacy_data_root = os.path.join("data", "highlights_data")
+        self._init_data_root()
         bot_config = context.get_config()
         admins = bot_config.get("admins_id", [])
         self.admins = [str(admin) for admin in admins] if admins else []
@@ -63,9 +66,18 @@ class HighlightsPlugin(Star):
         else:
             logger.warning("未找到任何管理员ID，某些需要管理员权限的命令可能无法使用")
 
+    def _init_data_root(self):
+        os.makedirs(self.data_root, exist_ok=True)
+        # 兼容迁移旧目录数据，避免历史精华丢失
+        if os.path.isdir(self.legacy_data_root):
+            try:
+                shutil.copytree(self.legacy_data_root, self.data_root, dirs_exist_ok=True)
+                logger.info(f"已将旧数据目录迁移到新目录: {self.legacy_data_root} -> {self.data_root}")
+            except Exception as e:
+                logger.warning(f"迁移旧数据目录失败，将继续使用新目录: {e}")
+
     def create_main_folder(self):
-        if not os.path.exists(self.data_root):
-            os.makedirs(self.data_root)
+        os.makedirs(self.data_root, exist_ok=True)
 
     def create_group_folder(self, group_id):
         group_id = str(group_id)
