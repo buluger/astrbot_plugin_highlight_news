@@ -130,24 +130,41 @@ class HighlightsPlugin(Star):
         copied_images = 0
         copied_entries = []
 
+        def copy_media_file(src_name: str, prefix: str) -> Optional[str]:
+            if not src_name:
+                return None
+            src_path = os.path.join(self.data_root, str(source_group_id), src_name)
+            if not os.path.isfile(src_path):
+                return None
+            ext = os.path.splitext(src_name)[1] or ".jpg"
+            new_name = f"{prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{ext}"
+            dst_path = os.path.join(self.data_root, str(target_group_id), new_name)
+            try:
+                shutil.copy2(src_path, dst_path)
+                return new_name
+            except Exception as e:
+                logger.warning(f"复制文件失败 {src_path} -> {dst_path}: {e}")
+                return None
+
         for entry in source_entries:
             new_entry = dict(entry)
             new_entry["id"] = str(uuid.uuid4())
 
             if new_entry.get("type") == "image" and new_entry.get("path"):
-                src_path = os.path.join(self.data_root, str(source_group_id), new_entry["path"])
-                if not os.path.isfile(src_path):
+                copied_path = copy_media_file(new_entry["path"], "image_copy")
+                if not copied_path:
                     continue
-                ext = os.path.splitext(new_entry["path"])[1] or ".jpg"
-                new_name = f"image_copy_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{ext}"
-                dst_path = os.path.join(self.data_root, str(target_group_id), new_name)
-                try:
-                    shutil.copy2(src_path, dst_path)
-                except Exception as e:
-                    logger.warning(f"复制图片失败 {src_path} -> {dst_path}: {e}")
-                    continue
-                new_entry["path"] = new_name
+                new_entry["path"] = copied_path
                 copied_images += 1
+
+            # 同步复制精华原发送人的头像文件，避免目标群精华图头像丢失
+            avatar_name = new_entry.get("origin_sender_avatar")
+            if avatar_name:
+                copied_avatar = copy_media_file(avatar_name, "avatar_copy")
+                if copied_avatar:
+                    new_entry["origin_sender_avatar"] = copied_avatar
+                else:
+                    new_entry["origin_sender_avatar"] = None
 
             copied_entries.append(new_entry)
 
