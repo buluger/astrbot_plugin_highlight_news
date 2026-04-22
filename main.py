@@ -388,6 +388,38 @@ class HighlightsPlugin(Star):
         except Exception:
             return None
 
+    async def _resolve_group_name(self, event: AstrMessageEvent, group_id: str) -> str:
+        # 先从事件对象取群名
+        message_obj = event.message_obj
+        for key in ("group_name", "group_title", "name"):
+            value = getattr(message_obj, key, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        # 再从 raw_message 兜底
+        raw_message = getattr(message_obj, "raw_message", {})
+        if isinstance(raw_message, dict):
+            for key in ("group_name", "group_title", "name"):
+                value = raw_message.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        # QQ 适配器兜底 API
+        try:
+            group_info = await event.bot.api.call_action(
+                "get_group_info",
+                group_id=int(group_id) if str(group_id).isdigit() else group_id,
+                no_cache=True,
+            )
+            if isinstance(group_info, dict):
+                name = (group_info.get("group_name") or group_info.get("name") or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+
+        return f"{group_id}"
+
     def _parse_paged_command(self, msg: str, aliases: Tuple[str, ...]) -> Optional[int]:
         stripped = msg.strip()
         normalized = stripped.replace(" ", "")
@@ -558,7 +590,7 @@ class HighlightsPlugin(Star):
         end = start + page_size
         return latest_first[start:end], total_pages, page
 
-    def _build_highlights_image(self, group_id: str, page: int = 1) -> Optional[str]:
+    def _build_highlights_image(self, group_id: str, page: int = 1, group_name: str = "") -> Optional[str]:
         if PILImage is None or ImageDraw is None:
             return None
         entries = self._load_highlights(group_id)
@@ -642,7 +674,10 @@ class HighlightsPlugin(Star):
                 )
                 card_plan.append(("text", e, header_name, footer, card_h, lines, line_h))
 
-        head_h = text_h("本群精华汇总", font_title) + text_h("meta", font_meta) + 14
+        title_text = f"{group_name} 群精华汇总" if group_name else "本群精华汇总"
+        stat_h = 58
+        banner_h = text_h(title_text, font_title) + 22
+        head_h = banner_h + 12 + stat_h + 12
         cards_h = sum(c[4] for c in card_plan) + card_gap * max(0, len(card_plan) - 1)
         footer_h = text_h("tips", font_meta) + 8
         img_h = max(500, margin * 2 + head_h + cards_h + footer_h)
@@ -650,15 +685,48 @@ class HighlightsPlugin(Star):
         img = PILImage.new("RGB", (img_w, img_h), (245, 247, 252))
         draw = ImageDraw.Draw(img)
         y = margin
-        draw.text((margin, y), "本群精华汇总", fill=(25, 30, 40), font=font_title)
-        y += text_h("本群精华汇总", font_title) + 6
-        draw.text(
-            (margin, y),
-            f"共 {len(entries)} 条  |  第 {current_page}/{total_pages} 页  |  每页 10 条（最新在前）",
-            fill=(90, 96, 108),
-            font=font_meta,
+        banner_x1, banner_y1 = margin, y
+        banner_x2, banner_y2 = margin + content_w, y + banner_h
+        draw.rounded_rectangle(
+            [banner_x1, banner_y1, banner_x2, banner_y2],
+            radius=16,
+            fill=(41, 73, 135),
+            outline=(23, 50, 105),
+            width=2,
         )
-        y += text_h("meta", font_meta) + 12
+        draw.text((banner_x1 + 20, banner_y1 + 10), title_text, fill=(245, 248, 255), font=font_title)
+        y += banner_h + 12
+
+        stat_items = [
+            ("总条数", f"{len(entries)}"),
+            ("总页数", f"{total_pages}"),
+            ("当前页", f"{current_page}"),
+        ]
+        chip_gap = 14
+        chip_w = int((content_w - chip_gap * 2) / 3)
+        chip_h = stat_h
+        for i, (k, v) in enumerate(stat_items):
+            cx1 = margin + i * (chip_w + chip_gap)
+            cy1 = y
+            cx2 = cx1 + chip_w
+            cy2 = cy1 + chip_h
+            draw.rounded_rectangle(
+                [cx1, cy1, cx2, cy2],
+                radius=12,
+                fill=(236, 243, 255) if k != "当前页" else (45, 92, 178),
+                outline=(171, 194, 236) if k != "当前页" else (30, 72, 149),
+                width=2,
+            )
+            label_color = (70, 93, 140) if k != "当前页" else (219, 232, 255)
+            value_color = (18, 40, 84) if k != "当前页" else (255, 255, 255)
+            draw.text((cx1 + 14, cy1 + 9), k, fill=label_color, font=font_meta)
+            draw.text(
+                (cx2 - 16 - draw.textlength(v, font=font_title), cy1 + 8),
+                v,
+                fill=value_color,
+                font=font_title,
+            )
+        y += chip_h + 12
 
         for item in card_plan:
             card_type = item[0]
@@ -668,6 +736,7 @@ class HighlightsPlugin(Star):
             card_h = item[4]
             x1, y1 = margin, y
             x2, y2 = margin + content_w, y + card_h
+            draw.rounded_rectangle([x1 + 2, y1 + 3, x2 + 2, y2 + 3], radius=14, fill=(229, 234, 244))
             draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=(255, 255, 255), outline=(225, 229, 238), width=2)
 
             top_x = x1 + inner
@@ -879,7 +948,8 @@ class HighlightsPlugin(Star):
             if PILImage is None:
                 yield event.plain_result("⭐服务器未安装 Pillow，无法生成长图。请 pip install Pillow")
                 return
-            out = self._build_highlights_image(group_id, page=page)
+            group_name = await self._resolve_group_name(event, group_id)
+            out = self._build_highlights_image(group_id, page=page, group_name=group_name)
             if not out:
                 yield event.plain_result("⭐本群还没有精华，无法生成汇总图。")
             else:
