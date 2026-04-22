@@ -7,6 +7,7 @@ import yaml
 import aiohttp
 import re
 import textwrap
+import shutil
 from typing import List, Optional, Tuple
 from astrbot import logger
 from astrbot.core.message.components import Image, Reply, At, Plain
@@ -106,6 +107,93 @@ class HighlightsPlugin(Star):
         entries.append(entry)
         self._save_highlights(group_id, entries)
 
+    def _parse_copy_group_command(self, msg: str) -> Optional[str]:
+        stripped = msg.strip()
+        normalized = stripped.replace(" ", "")
+        if not (stripped.startswith("精华复制") or stripped.startswith("/精华复制")):
+            return None
+        m = re.match(r"^/?精华复制(?:\s+|\+|＋)?(\d+)$", stripped)
+        if not m:
+            # 兼容旧格式：去空格后再匹配一次
+            m = re.match(r"^/?精华复制(?:\+|＋)?(\d+)$", normalized)
+        if not m:
+            return ""
+        return m.group(1)
+
+    def _copy_highlights_from_group(self, source_group_id: str, target_group_id: str) -> Tuple[int, int]:
+        source_entries = self._load_highlights(source_group_id)
+        if not source_entries:
+            return 0, 0
+
+        self.create_group_folder(target_group_id)
+        target_entries = self._load_highlights(target_group_id)
+        copied_images = 0
+        copied_entries = []
+
+        for entry in source_entries:
+            new_entry = dict(entry)
+            new_entry["id"] = str(uuid.uuid4())
+
+            if new_entry.get("type") == "image" and new_entry.get("path"):
+                src_path = os.path.join(self.data_root, str(source_group_id), new_entry["path"])
+                if not os.path.isfile(src_path):
+                    continue
+                ext = os.path.splitext(new_entry["path"])[1] or ".jpg"
+                new_name = f"image_copy_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{ext}"
+                dst_path = os.path.join(self.data_root, str(target_group_id), new_name)
+                try:
+                    shutil.copy2(src_path, dst_path)
+                except Exception as e:
+                    logger.warning(f"复制图片失败 {src_path} -> {dst_path}: {e}")
+                    continue
+                new_entry["path"] = new_name
+                copied_images += 1
+
+            copied_entries.append(new_entry)
+
+        if copied_entries:
+            target_entries.extend(copied_entries)
+            self._save_highlights(target_group_id, target_entries)
+        return len(copied_entries), copied_images
+
+    def _parse_delete_one_command(self, msg: str) -> Optional[int]:
+        stripped = msg.strip()
+        normalized = stripped.replace(" ", "")
+        if not (stripped.startswith("删除精华") or stripped.startswith("/删除精华")):
+            return None
+        m = re.match(r"^/?删除精华(?:\s+|\+|＋)?(\d+)$", stripped)
+        if not m:
+            # 兼容旧格式：去空格后再匹配一次
+            m = re.match(r"^/?删除精华(?:\+|＋)?(\d+)$", normalized)
+        if not m:
+            return -1
+        return int(m.group(1))
+
+    def _delete_highlight_by_index(self, group_id: str, index: int) -> Tuple[bool, str]:
+        entries = self._load_highlights(group_id)
+        total = len(entries)
+        if total <= 0:
+            return False, "⭐本群还没有精华可删除。"
+        if index < 1 or index > total:
+            return False, f"⭐编号超出范围，请输入 1 到 {total} 之间的数字。"
+
+        target = entries[index - 1]
+        removed_image = 0
+        if target.get("type") == "image" and target.get("path"):
+            img_path = os.path.join(self.data_root, str(group_id), target["path"])
+            if os.path.isfile(img_path):
+                try:
+                    os.remove(img_path)
+                    removed_image = 1
+                except Exception as e:
+                    logger.warning(f"删除精华图片失败 {img_path}: {e}")
+
+        entries.pop(index - 1)
+        self._save_highlights(group_id, entries)
+        if removed_image:
+            return True, f"⭐已删除精华 #{index}（并清理对应图片文件）。"
+        return True, f"⭐已删除精华 #{index}。"
+
     def _clear_group_highlights(self, group_id: str) -> Tuple[int, int]:
         entries = self._load_highlights(group_id)
         count = len(entries)
@@ -187,13 +275,105 @@ class HighlightsPlugin(Star):
             )
         return str(event.get_sender_id())
 
+    async def _resolve_sender_name(
+        self, event: AstrMessageEvent, group_id: str, user_id: str
+    ) -> str:
+        # 先走事件对象内已有字段（跨平台最通用）
+        name = self._extract_sender_name_from_event(event).strip()
+        if name and name != str(user_id):
+            return name
+
+        # 再尝试从原始消息结构提取
+        raw_message = getattr(event.message_obj, "raw_message", {})
+        if isinstance(raw_message, dict):
+            sender = raw_message.get("sender", {})
+            if isinstance(sender, dict):
+                name = (
+                    sender.get("card")
+                    or sender.get("nickname")
+                    or sender.get("title")
+                    or sender.get("name")
+                    or ""
+                ).strip()
+                if name and name != str(user_id):
+                    return name
+
+        # QQ 适配器兜底：查群成员资料，拿群名片/昵称
+        try:
+            member = await event.bot.api.call_action(
+                "get_group_member_info",
+                group_id=int(group_id) if str(group_id).isdigit() else group_id,
+                user_id=int(user_id) if str(user_id).isdigit() else user_id,
+                no_cache=True,
+            )
+            if isinstance(member, dict):
+                name = (member.get("card") or member.get("nickname") or "").strip()
+                if name:
+                    return name
+        except Exception as e:
+            logger.debug(f"获取群成员名称失败，回退 user_id: {e}")
+
+        return str(user_id)
+
+    def _extract_sender_avatar_url(self, sender: dict, user_id: str = "") -> str:
+        if not isinstance(sender, dict):
+            sender = {}
+        avatar_url = (
+            sender.get("avatar")
+            or sender.get("avatar_url")
+            or sender.get("face")
+            or sender.get("head")
+            or sender.get("img_url")
+            or ""
+        )
+        if isinstance(avatar_url, str) and avatar_url.strip():
+            return avatar_url.strip()
+        if str(user_id).isdigit():
+            return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=100"
+        return ""
+
+    async def _save_avatar_from_url(
+        self, group_id: str, user_id: str, avatar_url: str
+    ) -> Optional[str]:
+        if not avatar_url:
+            return None
+        try:
+            out_dir = os.path.join(self.data_root, str(group_id))
+            os.makedirs(out_dir, exist_ok=True)
+            ext = ".jpg"
+            low = avatar_url.lower()
+            if ".png" in low:
+                ext = ".png"
+            elif ".webp" in low:
+                ext = ".webp"
+            out_name = f"avatar_{user_id}_{int(time.time() * 1000)}{ext}"
+            out_path = os.path.join(out_dir, out_name)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(avatar_url, timeout=10) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.read()
+            with open(out_path, "wb") as f:
+                f.write(data)
+            return out_name
+        except Exception:
+            return None
+
     def _parse_paged_command(self, msg: str, aliases: Tuple[str, ...]) -> Optional[int]:
-        normalized = msg.strip().replace(" ", "")
+        stripped = msg.strip()
+        normalized = stripped.replace(" ", "")
         for alias in aliases:
-            if normalized == alias:
+            alias_clean = alias.strip()
+            alias_normalized = alias_clean.replace(" ", "")
+            if normalized == alias_normalized:
                 return 1
-            if normalized.startswith(alias):
-                tail = normalized[len(alias) :]
+            # 推荐新格式：/精华图 2
+            m = re.match(rf"^{re.escape(alias_clean)}\s+(\d+)$", stripped)
+            if m:
+                return max(1, int(m.group(1)))
+            # 兼容旧格式：/精华图2
+            if normalized.startswith(alias_normalized):
+                tail = normalized[len(alias_normalized) :]
                 if tail.isdigit():
                     return max(1, int(tail))
         return None
@@ -302,11 +482,25 @@ class HighlightsPlugin(Star):
         file_id = None
         plain = ""
         sender_name = ""
+        sender_id = ""
+        sender_avatar = None
         try:
             reply_id = int(reply_comp.id) if str(reply_comp.id).isdigit() else reply_comp.id
             reply_msg = await event.bot.api.call_action("get_msg", message_id=reply_id)
             if reply_msg and "message" in reply_msg:
                 sender_name = self._extract_sender_name_from_get_msg(reply_msg)
+                sender = reply_msg.get("sender", {}) if isinstance(reply_msg, dict) else {}
+                if isinstance(sender, dict):
+                    sender_id = str(
+                        sender.get("user_id")
+                        or sender.get("uid")
+                        or sender.get("id")
+                        or ""
+                    )
+                    avatar_url = self._extract_sender_avatar_url(sender, sender_id)
+                    sender_avatar = await self._save_avatar_from_url(
+                        str(event.message_obj.group_id), sender_id or "unknown", avatar_url
+                    )
                 chain = reply_msg["message"]
                 if isinstance(chain, list):
                     for part in chain:
@@ -322,7 +516,7 @@ class HighlightsPlugin(Star):
                         file_id = m.group(1)
         except Exception as e:
             logger.error(f"获取引用消息失败: {e}")
-        return plain.strip(), file_id, sender_name
+        return plain.strip(), file_id, sender_name, sender_id, sender_avatar
 
     def _paginate_entries(self, entries: List[dict], page: int, page_size: int = 10):
         page = max(1, page)
@@ -343,132 +537,165 @@ class HighlightsPlugin(Star):
             return None
 
         page_entries, total_pages, current_page = self._paginate_entries(entries, page, 10)
-
-        margin = 26
+        margin = 24
         card_gap = 18
-        inner_gap = 12
-        title_size = 34
-        meta_size = 20
-        body_size = 22
+        inner = 18
         img_w = 1080
+        avatar_size = 54
+        title_size = 34
+        sender_size = 22
+        body_size = 24
+        meta_size = 18
         font_body = _pick_cjk_font(body_size)
         if font_body is None:
             return None
         font_title = _pick_cjk_font(title_size) or font_body
+        font_sender = _pick_cjk_font(sender_size) or font_body
         font_meta = _pick_cjk_font(meta_size) or font_body
 
-        def text_height(draw_obj, text, font):
-            bbox = draw_obj.textbbox((0, 0), text if text else " ", font=font)
+        dummy = ImageDraw.Draw(PILImage.new("RGB", (10, 10), (255, 255, 255)))
+
+        def text_h(text: str, font) -> int:
+            bbox = dummy.textbbox((0, 0), text if text else " ", font=font)
             return bbox[3] - bbox[1]
 
-        dummy = ImageDraw.Draw(PILImage.new("RGB", (16, 16), (255, 255, 255)))
-        text_line_h = text_height(dummy, "测试文字", font_body)
         content_w = img_w - margin * 2
-        max_img_h = 420
-        max_text_chars = 42
-        min_card_h = 130
+        body_w = content_w - inner * 2
+        max_text_chars = 36
+        max_img_h = 380
+        min_card_h = 230
 
         card_plan = []
         for idx, e in enumerate(page_entries, 1):
-            sender_name = e.get("sender_name") or str(e.get("user_id", "未知用户"))
+            sender_name = (
+                e.get("origin_sender_name")
+                or e.get("sender_name")
+                or str(e.get("origin_sender_id") or e.get("user_id") or "未知用户")
+            )
+            submitter = e.get("submitter_name") or sender_name
+            submit_time = e.get("submit_time")
+            if isinstance(submit_time, (int, float)):
+                submit_time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(submit_time))
+            else:
+                submit_time_str = "未知时间"
+            footer = f"投稿人：{submitter}  ·  {submit_time_str}"
             global_idx = len(entries) - ((current_page - 1) * 10 + idx) + 1
-            title = f"#{global_idx} 投稿人：{sender_name}"
+            header_name = f"#{global_idx} {sender_name}"
+
             if e.get("type") == "image" and e.get("path"):
                 img_path = os.path.join(self.data_root, str(group_id), e["path"])
-                show_img_h = 0
+                show_h = text_h("[图片加载失败]", font_body)
                 if os.path.isfile(img_path):
                     try:
                         with PILImage.open(img_path) as src:
                             sw, sh = src.size
-                        max_w = content_w - inner_gap * 2
-                        ratio = min(max_w / max(1, sw), max_img_h / max(1, sh), 1.0)
-                        show_img_h = int(sh * ratio)
+                        ratio = min(body_w / max(1, sw), max_img_h / max(1, sh), 1.0)
+                        show_h = int(sh * ratio)
                     except Exception:
-                        show_img_h = 0
-                extra = text_line_h if show_img_h == 0 else show_img_h
-                card_h = max(min_card_h, inner_gap * 4 + text_height(dummy, title, font_meta) + extra)
-                card_plan.append(("image", e, title, card_h))
+                        pass
+                card_h = max(
+                    min_card_h,
+                    inner * 2 + avatar_size + inner + show_h + inner + text_h(footer, font_meta),
+                )
+                card_plan.append(("image", e, header_name, footer, card_h))
             else:
                 raw = (e.get("text") or "").replace("\r\n", "\n").strip() or "[空文本]"
-                wrapped = []
+                lines = []
                 for line in raw.split("\n"):
-                    wrapped.extend(
-                        textwrap.wrap(
-                            line,
-                            width=max_text_chars,
-                            break_long_words=True,
-                            break_on_hyphens=False,
-                        )
-                        or [""]
+                    lines.extend(
+                        textwrap.wrap(line, width=max_text_chars, break_long_words=True, break_on_hyphens=False) or [""]
                     )
-                text_h = max(1, len(wrapped)) * (text_line_h + 8)
-                card_h = max(min_card_h, inner_gap * 4 + text_height(dummy, title, font_meta) + text_h)
-                card_plan.append(("text", e, title, card_h, wrapped))
+                line_h = text_h("测试", font_body) + 8
+                text_total_h = max(1, len(lines)) * line_h
+                card_h = max(
+                    min_card_h,
+                    inner * 2 + avatar_size + inner + text_total_h + inner + text_h(footer, font_meta),
+                )
+                card_plan.append(("text", e, header_name, footer, card_h, lines, line_h))
 
-        head_h = (
-            text_height(dummy, "本群精华汇总", font_title)
-            + text_height(dummy, "meta", font_meta)
-            + inner_gap
-        )
-        cards_h = sum(x[3] for x in card_plan) + card_gap * max(0, len(card_plan) - 1)
-        footer_h = text_height(dummy, "footer", font_meta) + 12
-        img_h = max(420, margin * 2 + head_h + cards_h + footer_h)
+        head_h = text_h("本群精华汇总", font_title) + text_h("meta", font_meta) + 14
+        cards_h = sum(c[4] for c in card_plan) + card_gap * max(0, len(card_plan) - 1)
+        footer_h = text_h("tips", font_meta) + 8
+        img_h = max(500, margin * 2 + head_h + cards_h + footer_h)
 
         img = PILImage.new("RGB", (img_w, img_h), (245, 247, 252))
         draw = ImageDraw.Draw(img)
         y = margin
-
         draw.text((margin, y), "本群精华汇总", fill=(25, 30, 40), font=font_title)
-        y += text_height(dummy, "本群精华汇总", font_title) + 6
-        head_meta = f"共 {len(entries)} 条  |  第 {current_page}/{total_pages} 页  |  每页 10 条（最新在前）"
-        draw.text((margin, y), head_meta, fill=(90, 96, 108), font=font_meta)
-        y += text_height(dummy, head_meta, font_meta) + inner_gap
-
-        card_bg = (255, 255, 255)
-        card_border = (225, 229, 238)
-        text_color = (42, 46, 54)
-        sub_color = (100, 106, 118)
+        y += text_h("本群精华汇总", font_title) + 6
+        draw.text(
+            (margin, y),
+            f"共 {len(entries)} 条  |  第 {current_page}/{total_pages} 页  |  每页 10 条（最新在前）",
+            fill=(90, 96, 108),
+            font=font_meta,
+        )
+        y += text_h("meta", font_meta) + 12
 
         for item in card_plan:
             card_type = item[0]
-            card_h = item[3]
+            e = item[1]
+            header_name = item[2]
+            footer = item[3]
+            card_h = item[4]
             x1, y1 = margin, y
             x2, y2 = margin + content_w, y + card_h
-            draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=card_bg, outline=card_border, width=2)
-            cursor_y = y1 + inner_gap
-            title = item[2]
-            draw.text((x1 + inner_gap, cursor_y), title, fill=sub_color, font=font_meta)
-            cursor_y += text_height(dummy, title, font_meta) + inner_gap
+            draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=(255, 255, 255), outline=(225, 229, 238), width=2)
+
+            top_x = x1 + inner
+            top_y = y1 + inner
+            avatar_path = e.get("origin_sender_avatar") or ""
+            avatar_full = os.path.join(self.data_root, str(group_id), avatar_path) if avatar_path else ""
+            avatar_drawn = False
+            if avatar_full and os.path.isfile(avatar_full):
+                try:
+                    with PILImage.open(avatar_full) as av:
+                        av = av.convert("RGB").resize((avatar_size, avatar_size))
+                        mask = PILImage.new("L", (avatar_size, avatar_size), 0)
+                        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+                        img.paste(av, (top_x, top_y), mask)
+                        avatar_drawn = True
+                except Exception:
+                    avatar_drawn = False
+            if not avatar_drawn:
+                draw.ellipse((top_x, top_y, top_x + avatar_size, top_y + avatar_size), fill=(222, 230, 245))
+                draw.text((top_x + 16, top_y + 13), "?", fill=(80, 92, 120), font=font_sender)
+            draw.text((top_x + avatar_size + 12, top_y + 12), header_name, fill=(66, 72, 84), font=font_sender)
+
+            body_top = top_y + avatar_size + inner
+            body_bottom = y2 - inner - text_h(footer, font_meta)
+            body_h = max(20, body_bottom - body_top)
 
             if card_type == "image":
-                e = item[1]
                 img_path = os.path.join(self.data_root, str(group_id), e.get("path", ""))
                 if os.path.isfile(img_path):
                     try:
                         with PILImage.open(img_path) as src:
                             src = src.convert("RGB")
-                            max_w = content_w - inner_gap * 2
-                            max_h = max_img_h
-                            ratio = min(max_w / max(1, src.width), max_h / max(1, src.height), 1.0)
+                            ratio = min(body_w / max(1, src.width), body_h / max(1, src.height), 1.0)
                             nw = max(1, int(src.width * ratio))
                             nh = max(1, int(src.height * ratio))
                             resized = src.resize((nw, nh))
-                            img_x = x1 + (content_w - nw) // 2
-                            img.paste(resized, (img_x, cursor_y))
+                            px = x1 + inner + (body_w - nw) // 2
+                            py = body_top + (body_h - nh) // 2
+                            img.paste(resized, (px, py))
                     except Exception:
-                        draw.text((x1 + inner_gap, cursor_y), "[图片加载失败]", fill=text_color, font=font_body)
+                        draw.text((x1 + inner, body_top), "[图片加载失败]", fill=(42, 46, 54), font=font_body)
                 else:
-                    draw.text((x1 + inner_gap, cursor_y), "[图片文件已丢失]", fill=text_color, font=font_body)
+                    draw.text((x1 + inner, body_top), "[图片文件已丢失]", fill=(42, 46, 54), font=font_body)
             else:
-                wrapped = item[4]
-                for line in wrapped:
-                    draw.text((x1 + inner_gap, cursor_y), line, fill=text_color, font=font_body)
-                    cursor_y += text_line_h + 8
+                lines = item[5]
+                line_h = item[6]
+                total_h = max(1, len(lines)) * line_h
+                ty = body_top + max(0, (body_h - total_h) // 2)
+                for line in lines:
+                    draw.text((x1 + inner, ty), line, fill=(42, 46, 54), font=font_body)
+                    ty += line_h
 
+            foot_w = draw.textlength(footer, font=font_meta)
+            draw.text((x2 - inner - foot_w, y2 - inner - text_h(footer, font_meta)), footer, fill=(100, 106, 118), font=font_meta)
             y += card_h + card_gap
 
-        footer_text = "翻页示例：精华图2  或  /精华图3"
-        draw.text((margin, y), footer_text, fill=(110, 118, 130), font=font_meta)
+        draw.text((margin, y), "翻页示例：精华图 2  或  /精华图 3", fill=(110, 118, 130), font=font_meta)
 
         out_dir = os.path.join(self.data_root, str(group_id))
         os.makedirs(out_dir, exist_ok=True)
@@ -505,8 +732,56 @@ class HighlightsPlugin(Star):
         self.admin_settings = self._load_admin_settings()
 
         page = self._parse_paged_command(msg, ("精华图", "/精华图", "精华列表", "/精华列表"))
+        help_text = (
+            "⭐精华插件指令一览\n"
+            "1. /精华 或 精华：随机发送一条精华\n"
+            "2. /精华图 或 精华图：查看精华汇总图（默认第1页）\n"
+            "3. /精华图 2（数字可改）：查看精华汇总图指定页\n"
+            "4. /精华列表 或 精华列表：与精华图相同\n"
+            "5. 精华投稿 + 文字/图片：投稿精华\n"
+            "6. 精华权限+模式数字：设置投稿权限（管理员）\n"
+            "7. 戳戳冷却+秒数：设置戳一戳冷却（管理员）\n"
+            "8. /删除精华 编号：删除指定编号的精华（管理员）\n"
+            "9. /删除全部精华：清空当前群全部精华（管理员）\n"
+            "10. /精华复制 群号：复制指定群的精华到当前群（管理员）"
+        )
 
-        if msg.startswith("精华权限"):
+        copy_from_group = self._parse_copy_group_command(msg)
+        delete_one_idx = self._parse_delete_one_command(msg)
+        if msg in ("/精华帮助", "精华帮助"):
+            yield event.plain_result(help_text)
+
+        elif delete_one_idx is not None:
+            if not self.is_admin(user_id):
+                yield event.plain_result("权限不足，仅可由bot管理员执行")
+                return
+            if delete_one_idx <= 0:
+                yield event.plain_result("⭐格式错误，请使用：/删除精华 编号")
+                return
+            ok, text = self._delete_highlight_by_index(group_id, delete_one_idx)
+            yield event.plain_result(text)
+            if not ok:
+                return
+
+        elif copy_from_group is not None:
+            if not self.is_admin(user_id):
+                yield event.plain_result("权限不足，仅可由bot管理员执行")
+                return
+            if copy_from_group == "":
+                yield event.plain_result("⭐格式错误，请使用：/精华复制 群号")
+                return
+            if copy_from_group == group_id:
+                yield event.plain_result("⭐不能从当前群复制到当前群，请填写其他群号。")
+                return
+            copied_entries, copied_images = self._copy_highlights_from_group(copy_from_group, group_id)
+            if copied_entries <= 0:
+                yield event.plain_result(f"⭐群 {copy_from_group} 没有可复制的精华，或复制失败。")
+                return
+            yield event.plain_result(
+                f"⭐复制完成：从群 {copy_from_group} 导入 {copied_entries} 条精华到当前群，其中图片 {copied_images} 条。"
+            )
+
+        elif msg.startswith("精华权限"):
             if not self.is_admin(user_id):
                 yield event.plain_result("权限不足，仅可由bot管理员设置")
                 return
@@ -593,7 +868,12 @@ class HighlightsPlugin(Star):
                 return
 
             rest = msg[len("精华投稿") :].strip()
-            current_sender_name = self._extract_sender_name_from_event(event)
+            current_sender_name = await self._resolve_sender_name(event, group_id, user_id)
+            event_sender = getattr(event.message_obj, "sender", {})
+            current_sender_avatar_url = self._extract_sender_avatar_url(event_sender, user_id)
+            current_sender_avatar = await self._save_avatar_from_url(
+                group_id, user_id, current_sender_avatar_url
+            )
 
             messages = event.message_obj.message
             image_comp = next((m for m in messages if isinstance(m, Image)), None)
@@ -602,14 +882,21 @@ class HighlightsPlugin(Star):
             file_id = image_comp.file if image_comp else None
             reply_text = ""
             reply_sender_name = ""
+            reply_sender_id = ""
+            reply_sender_avatar = None
             if reply_comp:
-                rt, rf, rs = await self._get_reply_text_and_image(event, reply_comp)
+                rt, rf, rs, ruid, rav = await self._get_reply_text_and_image(event, reply_comp)
                 reply_text = rt
                 reply_sender_name = rs
+                reply_sender_id = ruid
+                reply_sender_avatar = rav
                 if not file_id and rf:
                     file_id = rf
 
-            submitter_name = reply_sender_name or current_sender_name
+            origin_sender_name = reply_sender_name or current_sender_name
+            origin_sender_id = reply_sender_id or user_id
+            origin_sender_avatar = reply_sender_avatar or current_sender_avatar
+            submitter_name = current_sender_name
             text_to_save = rest
             if not text_to_save and reply_text:
                 text_to_save = reply_text
@@ -629,7 +916,13 @@ class HighlightsPlugin(Star):
                                 "path": rel,
                                 "text": None,
                                 "user_id": user_id,
-                                "sender_name": submitter_name,
+                                "sender_name": origin_sender_name,
+                                "origin_sender_name": origin_sender_name,
+                                "origin_sender_id": origin_sender_id,
+                                "origin_sender_avatar": origin_sender_avatar,
+                                "submitter_name": submitter_name,
+                                "submitter_id": user_id,
+                                "submit_time": int(time.time()),
                             },
                         )
                         chain = [Reply(id=msg_id), Plain(text="⭐精华投稿成功！（图片）")]
@@ -651,7 +944,13 @@ class HighlightsPlugin(Star):
                         "path": None,
                         "text": text_to_save,
                         "user_id": user_id,
-                        "sender_name": submitter_name,
+                        "sender_name": origin_sender_name,
+                        "origin_sender_name": origin_sender_name,
+                        "origin_sender_id": origin_sender_id,
+                        "origin_sender_avatar": origin_sender_avatar,
+                        "submitter_name": submitter_name,
+                        "submitter_id": user_id,
+                        "submit_time": int(time.time()),
                     },
                 )
                 msg_id = str(event.message_obj.message_id)
