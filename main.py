@@ -48,7 +48,7 @@ def _pick_cjk_font(size: int):
 @register(
     "quote_collocter",
     "浅夏旧入梦",
-    "发送「精华投稿」+文字或图片保存精华；「/精华」随机一条；「精华图」生成汇总长图。戳一戳随机一条。",
+    "发送「精华投稿」+文字或图片保存精华；「/精华」随机一条；「精华 编号」按精华图序号查看；「精华图」生成汇总长图。戳一戳随机一条。",
     "1.0",
 )
 class HighlightsPlugin(Star):
@@ -196,6 +196,42 @@ class HighlightsPlugin(Star):
             m = re.match(r"^/?删除精华(?:\+|＋)?(\d+)$", normalized)
         if not m:
             return -1
+        return int(m.group(1))
+
+    def _parse_highlight_get_one_command(self, msg: str) -> Optional[int]:
+        """按精华图卡片上的 #序号 取一条；与「删除精华 编号」编号规则一致。返回 None 表示非本指令，-1 表示格式错误。"""
+        stripped = msg.strip()
+        normalized = stripped.replace(" ", "")
+        if stripped in ("精华", "/精华"):
+            return None
+        if not (stripped.startswith("精华") or stripped.startswith("/精华")):
+            return None
+        exclude = (
+            "精华投稿",
+            "精华图",
+            "精华列表",
+            "精华权限",
+            "精华复制",
+            "精华帮助",
+            "删除精华",
+            "/精华投稿",
+            "/精华图",
+            "/精华列表",
+            "/精华权限",
+            "/精华复制",
+            "/精华帮助",
+            "/删除精华",
+        )
+        for prefix in exclude:
+            if stripped.startswith(prefix):
+                return None
+        m = re.match(r"^/?精华(?:\s+|\+|＋)?(\d+)$", stripped)
+        if not m:
+            m = re.match(r"^/?精华(?:\+|＋)?(\d+)$", normalized)
+        if not m:
+            if re.match(r"^/?精华", stripped):
+                return -1
+            return None
         return int(m.group(1))
 
     def _delete_highlight_by_index(self, group_id: str, index: int) -> Tuple[bool, str]:
@@ -833,19 +869,21 @@ class HighlightsPlugin(Star):
         help_text = (
             "⭐精华插件指令一览\n"
             "1. /精华 或 精华：随机发送一条精华\n"
-            "2. /精华图 或 精华图：查看精华汇总图（默认第1页）\n"
-            "3. /精华图 2（数字可改）：查看精华汇总图指定页\n"
-            "4. /精华列表 或 精华列表：与精华图相同\n"
-            "5. 精华投稿 + 文字/图片：投稿精华\n"
-            "6. 精华权限+模式数字：设置投稿权限（管理员）\n"
-            "7. 戳戳冷却+秒数：设置戳一戳冷却（管理员）\n"
-            "8. /删除精华 编号：删除指定编号的精华（管理员）\n"
-            "9. /删除全部精华：清空当前群全部精华（管理员）\n"
-            "10. /精华复制 群号：复制指定群的精华到当前群（管理员）"
+            "2. /精华 编号 或 精华 编号：按精华图上的 #序号 发送对应一条（编号含义与 /删除精华 编号 相同）\n"
+            "3. /精华图 或 精华图：查看精华汇总图（默认第1页）\n"
+            "4. /精华图 2（数字可改）：查看精华汇总图指定页\n"
+            "5. /精华列表 或 精华列表：与精华图相同\n"
+            "6. 精华投稿 + 文字/图片：投稿精华\n"
+            "7. 精华权限+模式数字：设置投稿权限（管理员）\n"
+            "8. 戳戳冷却+秒数：设置戳一戳冷却（管理员）\n"
+            "9. /删除精华 编号：删除指定编号的精华（管理员）\n"
+            "10. /删除全部精华：清空当前群全部精华（管理员）\n"
+            "11. /精华复制 群号：复制指定群的精华到当前群（管理员）"
         )
 
         copy_from_group = self._parse_copy_group_command(msg)
         delete_one_idx = self._parse_delete_one_command(msg)
+        get_one_idx = self._parse_highlight_get_one_command(msg)
         if msg in ("/精华帮助", "精华帮助"):
             yield event.plain_result(help_text)
 
@@ -925,6 +963,32 @@ class HighlightsPlugin(Star):
             yield event.plain_result(
                 f"⭐已清空本群全部精华，共删除 {deleted_entries} 条记录，清理 {deleted_files} 个文件。"
             )
+
+        elif get_one_idx is not None:
+            if get_one_idx <= 0:
+                yield event.plain_result("⭐格式错误，请使用：精华 编号 或 /精华 编号（编号为正整数，与精华图上 # 一致）")
+                return
+            entries = self._load_highlights(group_id)
+            total = len(entries)
+            if total <= 0:
+                yield event.plain_result(
+                    "⭐本群还没有精华哦~\n请发送「精华投稿」添加文字或图片精华！"
+                )
+                return
+            if get_one_idx < 1 or get_one_idx > total:
+                yield event.plain_result(f"⭐编号超出范围，当前共有 {total} 条精华（编号 1～{total}）。")
+                return
+            picked = entries[get_one_idx - 1]
+            if picked.get("type") == "image" and picked.get("path"):
+                full = os.path.join(self.data_root, group_id, picked["path"])
+                if os.path.isfile(full):
+                    yield event.image_result(full)
+                else:
+                    yield event.plain_result("⭐该条图片文件已丢失，可删除后重新投稿。")
+            elif picked.get("type") == "text" and picked.get("text"):
+                yield event.plain_result(picked["text"])
+            else:
+                yield event.plain_result("⭐数据异常，请重新投稿。")
 
         elif msg in ("/精华", "精华"):
             picked = self._random_highlight(group_id)
